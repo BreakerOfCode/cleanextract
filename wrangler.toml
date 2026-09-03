@@ -1,0 +1,11 @@
+name = "cleanextract"
+main = "worker.js"
+compatibility_date = "2026-09-01"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+X402_FACILITATOR_URL = "https://facilitator.payai.network"
+
+[observability]
+enabled = true
+head_sampling_rate = 1

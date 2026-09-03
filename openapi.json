@@ -1,0 +1,64 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "CleanExtract",
+    "version": "0.3.0",
+    "description": "Convert public HTML or a public URL into token-dense Markdown. Successful extractions cost USD 0.05 through x402 v2 USDC on Base."
+  },
+  "servers": [
+    {
+      "url": "https://extract.getstringer.app"
+    }
+  ],
+  "paths": {
+    "/v1/execute": {
+      "post": {
+        "operationId": "cleanExtract",
+        "summary": "Extract Markdown from HTML or a public URL",
+        "parameters": [
+          {
+            "name": "PAYMENT-SIGNATURE",
+            "in": "header",
+            "required": false,
+            "description": "Base64-encoded x402 v2 payment payload returned after satisfying the 402 challenge.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "url_or_html": {
+                    "type": "string",
+                    "description": "A public HTTP(S) URL or raw HTML string."
+                  }
+                },
+                "required": ["url_or_html"],
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Extraction succeeded and the response includes PAYMENT-RESPONSE."
+          },
+          "400": {
+            "description": "Invalid input or a blocked URL."
+          },
+          "402": {
+            "description": "Payment required. Read PAYMENT-REQUIRED for the x402 v2 challenge."
+          },
+          "502": {
+            "description": "The public upstream could not be fetched safely."
+          }
+        }
+      }
+    }
+  }
+}
