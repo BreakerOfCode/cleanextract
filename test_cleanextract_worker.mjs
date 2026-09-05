@@ -3,6 +3,7 @@ import test from "node:test";
 
 import cleanExtractWorker, {
   BASE_NETWORK,
+  FreeTierLimiter,
   cleanHtmlToMarkdown,
   makePaymentRequirements,
   safeFetch,
@@ -48,6 +49,42 @@ function validPaymentPayload() {
         validAfter: "0",
         validBefore: "9999999999",
         nonce: `0x${"4".repeat(64)}`,
+      },
+    },
+  };
+}
+
+function freeTierEnvironment(initialUsed = 0) {
+  const claimsByCaller = new Map();
+  const finalized = [];
+  return {
+    finalized,
+    FREE_TIER_LIMITER: {
+      getByName(callerHash) {
+        if (!claimsByCaller.has(callerHash)) claimsByCaller.set(callerHash, initialUsed);
+        return {
+          async fetch(url, init) {
+            const pathname = new URL(url).pathname;
+            const body = JSON.parse(init.body);
+            if (pathname === "/claim") {
+              const used = claimsByCaller.get(callerHash);
+              if (used >= 3) {
+                return Response.json({ allowed: false, remaining: 0, reset_at: null });
+              }
+              claimsByCaller.set(callerHash, used + 1);
+              return Response.json({
+                allowed: true,
+                receipt_id: crypto.randomUUID(),
+                remaining: 3 - used - 1,
+              });
+            }
+            if (pathname === "/finalize") {
+              finalized.push(body);
+              return Response.json({ stored: true });
+            }
+            return Response.json({ error: "Not Found" }, { status: 404 });
+          },
+        };
       },
     },
   };
@@ -103,13 +140,131 @@ test("MCP rejects an unsupported browser origin", async () => {
   assert.equal(response.status, 403);
 });
 
+test("discovery paths reject an unsupported browser origin before route handling", async () => {
+  for (const route of ["/robots.txt", "/sitemap.xml", "/llms-full.txt"]) {
+    const response = await cleanExtractWorker.fetch(new Request(
+      `https://extract.getstringer.app${route}`,
+      { headers: { Origin: "https://attacker.example" } },
+    ), {}, {});
+
+    assert.equal(response.status, 403, route);
+    assert.equal(response.headers.get("access-control-allow-origin"), null, route);
+    assert.equal(response.headers.get("vary"), "Origin", route);
+    assert.deepEqual(await response.json(), { error: "Forbidden Origin" }, route);
+  }
+});
+
 test("REST validates input before asking for payment", async () => {
   const response = await cleanExtractWorker.fetch(restRequest({ query: "https://example.com" }), {}, {});
   assert.equal(response.status, 400);
   assert.match((await response.json()).message, /url_or_html/);
 });
 
-test("unpaid REST calls receive an x402 v2 Base USDC challenge", async () => {
+test("first free REST call succeeds without a claim header or signup", async () => {
+  const env = freeTierEnvironment();
+  const response = await cleanExtractWorker.fetch(restRequest({
+    url_or_html: "<h1>Free</h1><p>Result</p>",
+  }, { "CF-Connecting-IP": "198.51.100.10" }), env, {});
+
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("X-Stringer-Access-Tier"), "free");
+  assert.equal(response.headers.get("X-Stringer-Free-Remaining"), "2");
+  assert.equal(response.headers.get("PAYMENT-RESPONSE"), null);
+  const result = await response.json();
+  assert.equal(result.provenance.payment_verified, false);
+  assert.equal(result.provenance.settlement_rail, null);
+  assert.equal(env.finalized.length, 1);
+});
+
+test("first free MCP tool call succeeds without a claim header or signup", async () => {
+  const env = freeTierEnvironment();
+  const response = await cleanExtractWorker.fetch(mcpRequest({
+    jsonrpc: "2.0",
+    id: 4,
+    method: "tools/call",
+    params: {
+      name: "clean_extract",
+      arguments: { url_or_html: "<h1>Free MCP</h1>" },
+    },
+  }, { "CF-Connecting-IP": "198.51.100.11" }), env, {});
+
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("X-Stringer-Access-Tier"), "free");
+  assert.equal(response.headers.get("X-Stringer-Free-Remaining"), "2");
+  const result = await response.json();
+  assert.match(result.result.content[0].text, /Free MCP/);
+});
+
+test("the fourth unpaid call receives the exhausted-allowance x402 challenge", async () => {
+  const env = freeTierEnvironment();
+  const headers = { "CF-Connecting-IP": "198.51.100.12" };
+  for (const remaining of ["2", "1", "0"]) {
+    const response = await cleanExtractWorker.fetch(restRequest({
+      url_or_html: "<p>Free allowance</p>",
+    }, headers), env, {});
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("X-Stringer-Free-Remaining"), remaining);
+  }
+
+  const response = await cleanExtractWorker.fetch(restRequest({
+    url_or_html: "<p>Paid next</p>",
+  }, headers), env, {});
+  assert.equal(response.status, 402);
+  assert.equal(response.headers.get("X-Stringer-Free-Remaining"), "0");
+  const challenge = await response.json();
+  assert.match(challenge.error, /Free allowance exhausted: 3 free calls per source IP, total/);
+  assert.match(challenge.error, /allowance does not reset/);
+  assert.equal(challenge.accepts[0].amount, "50000");
+});
+
+test("FreeTierLimiter persists at most three claims in a caller Durable Object", async () => {
+  const rows = [];
+  const state = {
+    blockConcurrencyWhile(callback) {
+      return callback();
+    },
+    storage: {
+      transactionSync(callback) {
+        return callback();
+      },
+      sql: {
+        exec(statement, ...values) {
+          if (statement.includes("CREATE TABLE")) return {};
+          if (statement.startsWith("SELECT COUNT")) {
+            return { one: () => ({ count: rows.length }) };
+          }
+          if (statement.startsWith("INSERT INTO")) {
+            rows.push(values);
+            return {};
+          }
+          if (statement.startsWith("UPDATE")) return {};
+          throw new Error(`Unexpected SQL in test: ${statement}`);
+        },
+      },
+    },
+  };
+  const limiter = new FreeTierLimiter(state, {});
+  const claim = () => limiter.fetch(new Request("https://free-tier.internal/claim", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ caller_hash: "a".repeat(64), transport: "rest" }),
+  }));
+
+  for (const remaining of [2, 1, 0]) {
+    const response = await claim();
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), {
+      allowed: true,
+      receipt_id: rows.at(-1)[0],
+      remaining,
+    });
+  }
+  const exhausted = await claim();
+  assert.deepEqual(await exhausted.json(), { allowed: false, remaining: 0, reset_at: null });
+  assert.equal(rows.length, 3);
+});
+
+test("unpaid REST calls without an identifiable source receive an x402 v2 Base USDC challenge", async () => {
   const response = await cleanExtractWorker.fetch(restRequest({
     url_or_html: "<h1>Hello</h1>",
   }), {}, {});

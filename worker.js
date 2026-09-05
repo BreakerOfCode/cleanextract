@@ -275,6 +275,15 @@ function validateMcpOrigin(request) {
     return false;
   }
 }
+function forbiddenOriginResponse() {
+  return new Response(JSON.stringify({ error: "Forbidden Origin" }), {
+    status: 403,
+    headers: {
+      "Content-Type": "application/json",
+      "Vary": "Origin"
+    }
+  });
+}
 function mcpJson(payload, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(payload), {
     status,
@@ -524,6 +533,14 @@ function make402Response(serviceName, priceUsd, errorDetail = null, challengePre
 // CleanExtract Worker routes
 var PRICE_USD = 0.05;
 var MAX_FETCHED_BODY_BYTES = 1048576;
+// The hosted service grants three lifetime calls per source IP. Keep the public
+// reference implementation on the same contract: no signup, claim header, or reset.
+var FREE_CALL_LIMIT = 3;
+var ORIGIN_PROTECTED_DISCOVERY_PATHS = new Set([
+  "/robots.txt",
+  "/sitemap.xml",
+  "/llms-full.txt"
+]);
 var ROBOTS_TEXT = `User-agent: *
 Allow: /
 Sitemap: https://extract.getstringer.app/sitemap.xml
@@ -539,14 +556,15 @@ var LLMS_TEXT = `# CleanExtract
 
 > Token-efficient HTML-to-Markdown extraction for AI agents.
 
-- Price: USD 0.05 per successful extraction
+- Free allowance: the first 3 calls per source IP are free, total; no header or signup is needed and it does not reset
+- Paid price after the allowance: USD 0.05 per successful extraction
 - MCP transport: https://extract.getstringer.app/mcp
 - MCP protocol: Streamable HTTP
 - Tool: clean_extract
 - REST endpoint: https://extract.getstringer.app/v1/execute
 - Payment: x402 v2 USDC on Base mainnet (eip155:8453)
 
-Paid tool calls return an x402 challenge before extraction.
+Unpaid callers with a source IP receive up to 3 free calls without a claim header. After that allowance is exhausted, or when the caller cannot be identified, the service returns an x402 challenge.
 `;
 function discoveryResponse(body, contentType, method) {
   return new Response(method === "HEAD" ? null : body, {
@@ -558,6 +576,68 @@ function discoveryResponse(body, contentType, method) {
 }
 function paymentProof(request) {
   return request.headers.get("PAYMENT-SIGNATURE") || request.headers.get("X-402-Payment-Proof");
+}
+async function sha256Hex(value) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+async function claimFreeCall(request, env, transport) {
+  const callerIp = request.headers.get("CF-Connecting-IP")?.trim();
+  if (!callerIp || !env?.FREE_TIER_LIMITER) return { allowed: false, exhausted: false };
+  const callerHash = await sha256Hex(callerIp.toLowerCase());
+  try {
+    const stub = env.FREE_TIER_LIMITER.getByName(callerHash);
+    const response = await stub.fetch("https://free-tier.internal/claim", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ caller_hash: callerHash, transport })
+    });
+    if (!response.ok) return { allowed: false, exhausted: false };
+    const claim = await response.json();
+    if (claim.allowed) return { ...claim, callerHash, stub };
+    return { allowed: false, exhausted: true, remaining: 0, reset_at: claim.reset_at ?? null };
+  } catch (error) {
+    console.error(JSON.stringify({
+      event_type: "free_tier_error",
+      operation: "claim",
+      error: error instanceof Error ? error.message : String(error)
+    }));
+    return { allowed: false, exhausted: false };
+  }
+}
+async function authorizeCall(request, env, transport) {
+  const proof = paymentProof(request);
+  if (proof) {
+    const paymentVerdict = await verifyPayment(proof, env);
+    return paymentVerdict.valid ? { allowed: true, accessTier: "paid", paymentVerdict } : { allowed: false, paymentVerdict };
+  }
+  return { allowed: true, accessTier: "free_pending", transport };
+}
+async function activateFreeAllowance(request, env, authorization) {
+  if (authorization.accessTier !== "free_pending") return authorization;
+  const freeClaim = await claimFreeCall(request, env, authorization.transport);
+  if (freeClaim.allowed) return { allowed: true, accessTier: "free", freeClaim };
+  return {
+    allowed: false,
+    freeDenial: freeClaim,
+    paymentVerdict: await verifyPayment(null, env)
+  };
+}
+function makeFreeDenied402(authorization, transport) {
+  const serviceName = transport === "mcp" ? "CleanExtract MCP" : "CleanExtract";
+  const resourceUrl = transport === "mcp" ? "https://extract.getstringer.app/mcp" : "https://extract.getstringer.app/v1/execute";
+  if (!authorization.freeDenial?.exhausted) {
+    return make402Response(serviceName, PRICE_USD, authorization.paymentVerdict.error, "inv_cleanextract", resourceUrl);
+  }
+  const response = make402Response(
+    serviceName,
+    PRICE_USD,
+    `Free allowance exhausted: ${FREE_CALL_LIMIT} free calls per source IP, total. The allowance does not reset. Pay the challenge below to continue.`,
+    "inv_cleanextract",
+    resourceUrl
+  );
+  response.headers.set("X-Stringer-Free-Remaining", "0");
+  return response;
 }
 async function fetchPublicHtml(target) {
   try {
@@ -593,6 +673,42 @@ async function finalizePaidResponse(response, paymentVerdict, env, serviceName, 
   const settlementHeader = paymentResponseHeader(settlement);
   if (settlementHeader) response.headers.set("PAYMENT-RESPONSE", settlementHeader);
   return response;
+}
+async function finalizeFreeResponse(response, freeClaim, transport, resourceUrl) {
+  const receipt = {
+    receipt_id: freeClaim.receipt_id,
+    access_tier: "free",
+    transport,
+    caller_hash: freeClaim.callerHash,
+    status: response.status,
+    outcome: response.ok ? "success" : "rejected",
+    recorded_at: (/* @__PURE__ */ new Date()).toISOString(),
+    resource_url: resourceUrl
+  };
+  try {
+    await freeClaim.stub.fetch("https://free-tier.internal/finalize", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(receipt)
+    });
+  } catch (error) {
+    console.error(JSON.stringify({
+      event_type: "free_tier_error",
+      operation: "finalize",
+      receipt_id: receipt.receipt_id,
+      error: error instanceof Error ? error.message : String(error)
+    }));
+  }
+  response.headers.set("X-Stringer-Access-Tier", "free");
+  response.headers.set("X-Stringer-Receipt-ID", freeClaim.receipt_id);
+  response.headers.set("X-Stringer-Free-Remaining", String(freeClaim.remaining));
+  return response;
+}
+async function finalizeAuthorizedResponse(response, authorization, env, serviceName, resourceUrl, transport) {
+  if (authorization.accessTier === "free") {
+    return finalizeFreeResponse(response, authorization.freeClaim, transport, resourceUrl);
+  }
+  return finalizePaidResponse(response, authorization.paymentVerdict, env, serviceName, resourceUrl);
 }
 function mcpToolDefinition() {
   return {
@@ -689,21 +805,30 @@ async function handleStreamableHttp(request, env) {
     return mcpJson({ jsonrpc: "2.0", id, result: { tools: [mcpToolDefinition()] } });
   }
   if (method === "tools/call") {
-    const proof = paymentProof(request);
-    const paymentVerdict = await verifyPayment(proof, env);
-    if (!paymentVerdict.valid) {
-      return make402Response("CleanExtract MCP", PRICE_USD, paymentVerdict.error, "inv_cleanextract", request.url);
+    let authorization = await authorizeCall(request, env, "mcp");
+    if (!authorization.allowed) {
+      return make402Response("CleanExtract MCP", PRICE_USD, authorization.paymentVerdict.error, "inv_cleanextract", request.url);
     }
+    if (params?.name !== "clean_extract") {
+      return mcpError(id, -32601, `Tool not found: ${params?.name || "unknown"}`, 404);
+    }
+    if (typeof params?.arguments?.url_or_html !== "string" || params.arguments.url_or_html.length === 0) {
+      return mcpError(id, -32602, "url_or_html must be a non-empty string", 400);
+    }
+    authorization = await activateFreeAllowance(request, env, authorization);
+    if (!authorization.allowed) return makeFreeDenied402(authorization, "mcp");
     const toolResponse = await callMcpTool(id, params);
-    return finalizePaidResponse(toolResponse, paymentVerdict, env, "CleanExtract MCP", request.url);
+    return finalizeAuthorizedResponse(toolResponse, authorization, env, "CleanExtract MCP", request.url, "mcp");
   }
   return mcpError(id, -32601, `Method not found: ${method}`, 404);
 }
 var worker_default = {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
-    if (request.method === "OPTIONS" && url.pathname.startsWith("/mcp") && !validateMcpOrigin(request)) {
-      return mcpError(null, -32e3, "Forbidden Origin", 403);
+    const originProtected = ORIGIN_PROTECTED_DISCOVERY_PATHS.has(url.pathname)
+      || request.method === "OPTIONS" && url.pathname.startsWith("/mcp");
+    if (originProtected && !validateMcpOrigin(request)) {
+      return forbiddenOriginResponse();
     }
     if (request.method === "OPTIONS") {
       return new Response(null, { headers: corsHeaders() });
@@ -725,6 +850,13 @@ var worker_default = {
           tagline: "Token-efficient markdown & structured data extraction API for LLM context windows",
           monetization: "x402 on Base",
           price_usd: PRICE_USD,
+          free_allowance: {
+            calls: FREE_CALL_LIMIT,
+            scope: "lifetime",
+            resets: false,
+            key: "CF-Connecting-IP",
+            opt_in_required: false
+          },
           x402_receiver: RECEIVER_ADDRESS,
           status: "operational",
           mcp_endpoints: {
@@ -747,6 +879,10 @@ var worker_default = {
       });
     }
     if (url.pathname === "/v1/execute" && request.method === "POST") {
+      let authorization = await authorizeCall(request, env, "rest");
+      if (!authorization.allowed) {
+        return make402Response("CleanExtract", PRICE_USD, authorization.paymentVerdict.error, "inv_cleanextract", request.url);
+      }
       let body;
       try {
         body = await request.json();
@@ -757,11 +893,8 @@ var worker_default = {
       if (typeof target !== "string" || target.length === 0) {
         return restError("url_or_html must be a non-empty string", 400);
       }
-      const proof = paymentProof(request);
-      const paymentVerdict = await verifyPayment(proof, env);
-      if (!paymentVerdict.valid) {
-        return make402Response("CleanExtract", PRICE_USD, paymentVerdict.error, "inv_cleanextract", request.url);
-      }
+      authorization = await activateFreeAllowance(request, env, authorization);
+      if (!authorization.allowed) return makeFreeDenied402(authorization, "rest");
       let rawHtml = target;
       let sourceUrl = null;
       if (target.startsWith("http://") || target.startsWith("https://")) {
@@ -788,8 +921,8 @@ var worker_default = {
             metadata: extracted.metadata,
             tokens_saved: extracted.tokens_saved,
             compression_ratio: extracted.compression_ratio,
-            settlement_rail: paymentVerdict.rail,
-            payment_verified: true,
+            settlement_rail: authorization.accessTier === "paid" ? authorization.paymentVerdict.rail : null,
+            payment_verified: authorization.accessTier === "paid",
             processed_at: (/* @__PURE__ */ new Date()).toISOString()
           }
         }),
@@ -798,7 +931,7 @@ var worker_default = {
           headers: { "Content-Type": "application/json", ...corsHeaders() }
         }
       );
-      return finalizePaidResponse(extractionResponse, paymentVerdict, env, "CleanExtract", request.url);
+      return finalizeAuthorizedResponse(extractionResponse, authorization, env, "CleanExtract", request.url, "rest");
     }
     return new Response(JSON.stringify({ error: "Not Found" }), {
       status: 404,
@@ -806,8 +939,72 @@ var worker_default = {
     });
   }
 };
+class FreeTierLimiter {
+  constructor(state, env) {
+    this.state = state;
+    this.state.blockConcurrencyWhile(async () => {
+      this.state.storage.sql.exec(`
+        CREATE TABLE IF NOT EXISTS free_call_receipts (
+          receipt_id TEXT PRIMARY KEY,
+          caller_hash TEXT NOT NULL,
+          transport TEXT NOT NULL CHECK (transport IN ('mcp', 'rest')),
+          claimed_at INTEGER NOT NULL,
+          completed_at TEXT,
+          http_status INTEGER,
+          outcome TEXT NOT NULL DEFAULT 'started'
+        );
+      `);
+    });
+  }
+  async fetch(request) {
+    const url = new URL(request.url);
+    if (request.method !== "POST") return new Response(JSON.stringify({ error: "Method Not Allowed" }), { status: 405 });
+    let body;
+    try {
+      body = await request.json();
+    } catch (error) {
+      return new Response(JSON.stringify({ error: "Invalid JSON" }), { status: 400 });
+    }
+    if (url.pathname === "/claim") {
+      if (!/^[a-f0-9]{64}$/.test(body?.caller_hash || "") || !["mcp", "rest"].includes(body?.transport)) {
+        return new Response(JSON.stringify({ error: "Invalid claim" }), { status: 400 });
+      }
+      return this.state.storage.transactionSync(() => {
+        const used = this.state.storage.sql.exec("SELECT COUNT(*) AS count FROM free_call_receipts").one().count;
+        if (used >= FREE_CALL_LIMIT) {
+          return Response.json({ allowed: false, remaining: 0, reset_at: null });
+        }
+        const receiptId = crypto.randomUUID();
+        this.state.storage.sql.exec(
+          "INSERT INTO free_call_receipts (receipt_id, caller_hash, transport, claimed_at) VALUES (?, ?, ?, ?)",
+          receiptId,
+          body.caller_hash,
+          body.transport,
+          Date.now()
+        );
+        return Response.json({ allowed: true, receipt_id: receiptId, remaining: FREE_CALL_LIMIT - used - 1 });
+      });
+    }
+    if (url.pathname === "/finalize") {
+      if (!/^[0-9a-f-]{36}$/i.test(body?.receipt_id || "")) {
+        return new Response(JSON.stringify({ error: "Invalid receipt" }), { status: 400 });
+      }
+      this.state.storage.sql.exec(
+        "UPDATE free_call_receipts SET completed_at = ?, http_status = ?, outcome = ? WHERE receipt_id = ?",
+        body.recorded_at,
+        Number(body.status),
+        body.outcome,
+        body.receipt_id
+      );
+      return Response.json({ stored: true });
+    }
+    return new Response(JSON.stringify({ error: "Not Found" }), { status: 404 });
+  }
+}
 export {
   BASE_NETWORK,
+  FREE_CALL_LIMIT,
+  FreeTierLimiter,
   cleanHtmlToMarkdown,
   make402Response,
   makePaymentRequirements,

@@ -8,7 +8,9 @@ CleanExtract converts public HTML or a public URL into token-dense Markdown for 
 - REST: `https://extract.getstringer.app/v1/execute`
 - MCP tool: `clean_extract`
 
-Both paid surfaces charge USD 0.05 per successful extraction through x402 v2 USDC on Base (`eip155:8453`). An unpaid call returns HTTP `402` with the accepted payment requirement in `PAYMENT-REQUIRED`. A settled call returns HTTP `200` with a settlement receipt in `PAYMENT-RESPONSE`.
+The first three calls per source IP are free, total. They require no signup or claim header, and the allowance does not reset. After those calls, both surfaces charge USD 0.05 per successful extraction through x402 v2 USDC on Base (`eip155:8453`). An unpaid call after the allowance is exhausted returns HTTP `402` with the accepted payment requirement in `PAYMENT-REQUIRED`. A settled call returns HTTP `200` with a settlement receipt in `PAYMENT-RESPONSE`.
+
+Hosted contract verified 2026-09-05: the header-free REST request below returned HTTP `200`, `X-Stringer-Access-Tier: free`, and `X-Stringer-Free-Remaining: 2`. The legacy `X-Stringer-Free-Allowance: claim` header is accepted for compatibility but is not required.
 
 ## Install and run locally
 
@@ -26,7 +28,7 @@ The committed `X402_FACILITATOR_URL` is public configuration. If the selected fa
 npx wrangler secret put X402_FACILITATOR_AUTHORIZATION
 ```
 
-`PROCESSED_PROOFS` is an optional KV binding used as defense in depth for redeemed nonces. EIP-3009 settlement remains the authoritative replay defense.
+`FREE_TIER_LIMITER` is the included SQLite-backed Durable Object binding. It hashes the Cloudflare-provided source IP and records up to three claims for that caller. `PROCESSED_PROOFS` is an optional KV binding used as defense in depth for redeemed nonces. EIP-3009 settlement remains the authoritative replay defense.
 
 ## Test
 
@@ -46,6 +48,8 @@ curl -i https://extract.getstringer.app/v1/execute \
 ```
 
 Raw HTML is also accepted through `url_or_html`. See `openapi.json` and `RECIPES.md` for the response and payment flow.
+
+The first three requests from the source IP return HTTP `200` with `X-Stringer-Access-Tier: free` and `X-Stringer-Free-Remaining`. The fourth returns the x402 challenge. `CF-Connecting-IP` is supplied by Cloudflare; callers do not set a claim header.
 
 ## MCP
 

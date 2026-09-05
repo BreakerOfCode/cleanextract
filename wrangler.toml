@@ -3,6 +3,14 @@ main = "worker.js"
 compatibility_date = "2026-09-01"
 compatibility_flags = ["nodejs_compat"]
 
+[[durable_objects.bindings]]
+name = "FREE_TIER_LIMITER"
+class_name = "FreeTierLimiter"
+
+[exports.FreeTierLimiter]
+type = "durable-object"
+storage = "sqlite"
+
 [vars]
 X402_FACILITATOR_URL = "https://facilitator.payai.network"
 

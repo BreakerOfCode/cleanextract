@@ -1,8 +1,8 @@
 # CleanExtract recipes
 
-The hosted REST and MCP surfaces charge USD 0.05 per successful extraction through x402 v2 USDC on Base.
+The hosted REST and MCP surfaces give each source IP three free calls, total, with no signup or claim header. The allowance does not reset. Later calls cost USD 0.05 per successful extraction through x402 v2 USDC on Base.
 
-## Inspect the REST payment challenge
+## Use the free REST allowance
 
 ```bash
 curl -i https://extract.getstringer.app/v1/execute \
@@ -10,7 +10,7 @@ curl -i https://extract.getstringer.app/v1/execute \
   --data '{"url_or_html":"https://example.com"}'
 ```
 
-The HTTP `402` response carries a base64-encoded x402 v2 challenge in `PAYMENT-REQUIRED`. After a payer signs the accepted requirement, repeat the request with the signed payload:
+The first three calls from the source IP return HTTP `200`. `X-Stringer-Free-Remaining` reports how many calls remain. The fourth call returns HTTP `402` with a base64-encoded x402 v2 challenge in `PAYMENT-REQUIRED`. After a payer signs the accepted requirement, repeat the request with the signed payload:
 
 ```bash
 curl -i https://extract.getstringer.app/v1/execute \
@@ -30,7 +30,7 @@ curl -i https://extract.getstringer.app/mcp \
   --data '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
 ```
 
-The MCP tool is `clean_extract`. Its required argument is `url_or_html`. A `tools/call` request uses the same `PAYMENT-SIGNATURE` header and x402 flow as REST.
+The MCP tool is `clean_extract`. Its required argument is `url_or_html`. The first three REST or MCP tool calls share the source IP's free allowance. Later `tools/call` requests use the same `PAYMENT-SIGNATURE` header and x402 flow as REST.
 
 ## Python client
 

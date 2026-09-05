@@ -3,7 +3,7 @@
   "info": {
     "title": "CleanExtract",
     "version": "0.3.0",
-    "description": "Convert public HTML or a public URL into token-dense Markdown. Successful extractions cost USD 0.05 through x402 v2 USDC on Base."
+    "description": "Convert public HTML or a public URL into token-dense Markdown. The first 3 calls per source IP are free, total, with no signup or claim header; the allowance does not reset. Later successful extractions cost USD 0.05 through x402 v2 USDC on Base."
   },
   "servers": [
     {
@@ -20,7 +20,7 @@
             "name": "PAYMENT-SIGNATURE",
             "in": "header",
             "required": false,
-            "description": "Base64-encoded x402 v2 payment payload returned after satisfying the 402 challenge.",
+            "description": "Optional for the first 3 calls per source IP. After the free allowance, send the base64-encoded x402 v2 payment payload returned after satisfying the 402 challenge.",
             "schema": {
               "type": "string"
             }
@@ -46,13 +46,13 @@
         },
         "responses": {
           "200": {
-            "description": "Extraction succeeded and the response includes PAYMENT-RESPONSE."
+            "description": "Extraction succeeded. Free responses include X-Stringer-Free-Remaining; settled paid responses include PAYMENT-RESPONSE."
           },
           "400": {
             "description": "Invalid input or a blocked URL."
           },
           "402": {
-            "description": "Payment required. Read PAYMENT-REQUIRED for the x402 v2 challenge."
+            "description": "The 3-call source-IP allowance is exhausted or the caller cannot be identified. Read PAYMENT-REQUIRED for the x402 v2 challenge."
           },
           "502": {
             "description": "The public upstream could not be fetched safely."
