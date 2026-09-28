@@ -11,6 +11,12 @@ class_name = "FreeTierLimiter"
 type = "durable-object"
 storage = "sqlite"
 
+# FREE_TIER_HASH_KEY is a secret, not a var: it keys the HMAC that pseudonymises a caller
+# address before anything stores it. Set it with `wrangler secret put FREE_TIER_HASH_KEY`.
+# Without it the free tier stays closed and every request falls straight to the x402
+# challenge. Rotating it discards the existing mapping and grants every caller a fresh
+# allowance.
+
 [vars]
 X402_FACILITATOR_URL = "https://facilitator.payai.network"
 

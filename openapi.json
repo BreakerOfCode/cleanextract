@@ -1,64 +1,89 @@
 {
   "openapi": "3.1.0",
   "info": {
-    "title": "CleanExtract",
-    "version": "0.3.0",
-    "description": "Convert public HTML or a public URL into token-dense Markdown. The first 3 calls per source IP are free, total, with no signup or claim header; the allowance does not reset. Later successful extractions cost USD 0.05 through x402 v2 USDC on Base."
+    "title": "Stringer CleanExtract",
+    "version": "0.4.0",
+    "description": "A call is charged only when it returns usable content. The outline is free. Three usable extraction calls are free, total, then USD 0.05 per successful extraction through x402. The allowance does not reset. JSON-LD, Next.js, and Nuxt data can recover text from app shells."
   },
-  "servers": [
-    {
-      "url": "https://extract.getstringer.app"
-    }
-  ],
   "paths": {
+    "/v1/outline": {
+      "post": {
+        "operationId": "cleanExtractOutline",
+        "summary": "Get a free page outline without page text or payment",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/OutlineRequest" } } }
+        },
+        "responses": {
+          "200": { "description": "Free outline with section ids, byte sizes, total_bytes, fingerprint, and optional fallback_used.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/OutlineResponse" } } } },
+          "400": { "description": "Missing or invalid url_or_html." },
+          "422": { "$ref": "#/components/responses/UnchargedFailure" },
+          "502": { "$ref": "#/components/responses/UnchargedFailure" },
+          "504": { "$ref": "#/components/responses/UnchargedFailure" }
+        }
+      }
+    },
     "/v1/execute": {
       "post": {
         "operationId": "cleanExtract",
-        "summary": "Extract Markdown from HTML or a public URL",
+        "summary": "Extract a full page or selected sections; charge only for usable content",
         "parameters": [
-          {
-            "name": "PAYMENT-SIGNATURE",
-            "in": "header",
-            "required": false,
-            "description": "Optional for the first 3 calls per source IP. After the free allowance, send the base64-encoded x402 v2 payment payload returned after satisfying the 402 challenge.",
-            "schema": {
-              "type": "string"
-            }
-          }
+          { "name": "PAYMENT-SIGNATURE", "in": "header", "required": false, "description": "Base64-encoded x402 v2 payment payload after the three lifetime free extraction calls.", "schema": { "type": "string" } }
         ],
         "requestBody": {
           "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "type": "object",
-                "properties": {
-                  "url_or_html": {
-                    "type": "string",
-                    "description": "A public HTTP(S) URL or raw HTML string."
-                  }
-                },
-                "required": ["url_or_html"],
-                "additionalProperties": false
-              }
-            }
-          }
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ExtractRequest" } } }
         },
         "responses": {
-          "200": {
-            "description": "Extraction succeeded. Free responses include X-Stringer-Free-Remaining; settled paid responses include PAYMENT-RESPONSE."
-          },
-          "400": {
-            "description": "Invalid input or a blocked URL."
-          },
-          "402": {
-            "description": "The 3-call source-IP allowance is exhausted or the caller cannot be identified. Read PAYMENT-REQUIRED for the x402 v2 challenge."
-          },
-          "502": {
-            "description": "The public upstream could not be fetched safely."
-          }
+          "200": { "description": "Usable extraction with clean_markdown and optional fingerprint, sections_returned, sections_missing, output_bounds.sections_dropped, or fallback_used. X-Stringer-Access-Tier identifies a free response; PAYMENT-RESPONSE identifies a settled paid response." },
+          "400": { "description": "Missing or invalid input, section ids, or max_output_bytes." },
+          "402": { "description": "The lifetime free allowance is exhausted and a USD 0.05 x402 payment is required. Read PAYMENT-REQUIRED." },
+          "422": { "$ref": "#/components/responses/UnchargedFailure" },
+          "502": { "$ref": "#/components/responses/UnchargedFailure" },
+          "504": { "$ref": "#/components/responses/UnchargedFailure" }
         }
       }
+    }
+  },
+  "components": {
+    "schemas": {
+      "OutlineRequest": { "type": "object", "properties": { "url_or_html": { "type": "string", "description": "Public HTTP(S) URL or raw HTML." } }, "required": ["url_or_html"], "additionalProperties": false },
+      "ExtractRequest": {
+        "type": "object",
+        "properties": {
+          "url_or_html": { "type": "string", "description": "Public HTTP(S) URL or raw HTML." },
+          "sections": { "type": "array", "minItems": 1, "maxItems": 50, "items": { "type": "string", "pattern": "^s[1-9][0-9]*$" }, "description": "Ids from a fresh outline; returns only these sections in document order." },
+          "max_output_bytes": { "type": "integer", "minimum": 1, "maximum": 1048576, "description": "UTF-8 byte ceiling. Whole trailing sections are dropped first and listed in output_bounds.sections_dropped." }
+        },
+        "required": ["url_or_html"],
+        "additionalProperties": false
+      },
+      "OutlineResponse": {
+        "type": "object",
+        "properties": {
+          "status": { "type": "string", "const": "ok" },
+          "title": { "type": "string" },
+          "total_bytes": { "type": "integer" },
+          "fingerprint": { "type": "string", "description": "SHA-256 digest of the full extracted Markdown." },
+          "sections": { "type": "array", "items": { "type": "object", "properties": { "id": { "type": "string" }, "level": { "type": "integer" }, "heading": { "type": "string" }, "bytes": { "type": "integer" } }, "required": ["id", "level", "heading", "bytes"] } },
+          "fallback_used": { "type": "string", "enum": ["json_ld", "next_data", "nuxt_data"] }
+        },
+        "required": ["status", "title", "total_bytes", "fingerprint", "sections"]
+      },
+      "UnchargedFailure": {
+        "type": "object",
+        "properties": {
+          "status": { "type": "string", "enum": ["upstream_timeout", "upstream_http_error", "bot_challenge", "js_shell", "empty_extraction", "sections_not_found"] },
+          "reason": { "type": "string" },
+          "charged": { "type": "boolean", "const": false },
+          "sections_missing": { "type": "array", "items": { "type": "string" } },
+          "available_sections": { "type": "array", "items": { "type": "object" } }
+        },
+        "required": ["status", "reason", "charged"]
+      }
+    },
+    "responses": {
+      "UnchargedFailure": { "description": "Uncharged named failure. upstream_timeout returns 504, upstream_http_error returns 502, and bot_challenge, js_shell, empty_extraction, or sections_not_found returns 422. sections_not_found also lists sections_missing and available_sections.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UnchargedFailure" } } } }
     }
   }
 }

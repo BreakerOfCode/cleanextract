@@ -1,3 +1,10 @@
+// BOUNDARY RULE: this tree implements what an unauthenticated caller can observe about
+// CleanExtract and deliberately omits operator surfaces a caller cannot: Stripe issuance,
+// bearer-gated admin stats, and funnel telemetry. A behaviour belongs here when an
+// unauthenticated caller can observe it from outside; everything else stays out.
+import { classifyOutcome, FETCH_TIMEOUT_MS } from "./outcome.js";
+import { outlineMarkdown, selectSections, markdownFingerprint } from "./sections.js";
+//
 // HTML extraction and URL safety
 function unescapeHtml(str) {
   if (!str) return "";
@@ -533,8 +540,10 @@ function make402Response(serviceName, priceUsd, errorDetail = null, challengePre
 // CleanExtract Worker routes
 var PRICE_USD = 0.05;
 var MAX_FETCHED_BODY_BYTES = 1048576;
-// The hosted service grants three lifetime calls per source IP. Keep the public
-// reference implementation on the same contract: no signup, claim header, or reset.
+var MAX_OUTPUT_CEILING_BYTES = 1048576;
+var CONTENT_RATIO_THRESHOLD = 0.05;
+// The hosted service grants three lifetime calls, metered per network address. Keep the
+// public reference implementation on the same contract: no signup, claim header, or reset.
 var FREE_CALL_LIMIT = 3;
 var ORIGIN_PROTECTED_DISCOVERY_PATHS = new Set([
   "/robots.txt",
@@ -554,18 +563,48 @@ var SITEMAP_XML = `<?xml version="1.0" encoding="UTF-8"?>
 `;
 var LLMS_TEXT = `# CleanExtract
 
-> Token-efficient HTML-to-Markdown extraction for AI agents.
+> Free page outline, selected sections, and charges only for usable content.
 
-- Free allowance: the first 3 calls per source IP are free, total; no header or signup is needed and it does not reset
-- Paid price after the allowance: USD 0.05 per successful extraction
+- Free allowance: the first 3 calls are free, total; no signup and no claim header, and it does not reset
+- Paid price after the allowance: USD 0.05 per usable extraction. A call is charged only when it returns usable content.
+- Free outline: clean_extract_outline or POST /v1/outline. Returns status, title, total_bytes, fingerprint, and sections without page text.
+- Select sections: pass sections such as ["s2", "s3"] to clean_extract or POST /v1/execute. Success names sections_returned and sections_missing; a byte ceiling reports output_bounds.sections_dropped.
+- Named uncharged failures: upstream_timeout (504), upstream_http_error (502), bot_challenge (422), js_shell (422), empty_extraction (422), sections_not_found (422).
+- Structured-data recovery: JSON-LD, __NEXT_DATA__, or parseable window.__NUXT__ article text reports fallback_used. CleanExtract does not run JavaScript.
 - MCP transport: https://extract.getstringer.app/mcp
 - MCP protocol: Streamable HTTP
-- Tool: clean_extract
+- Tools: clean_extract and clean_extract_outline
 - REST endpoint: https://extract.getstringer.app/v1/execute
 - Payment: x402 v2 USDC on Base mainnet (eip155:8453)
 
-Unpaid callers with a source IP receive up to 3 free calls without a claim header. After that allowance is exhausted, or when the caller cannot be identified, the service returns an x402 challenge.
+An unpaid caller receives up to 3 usable extraction calls free with no signup and no claim header. The outline is free. After the allowance is exhausted, or when the caller cannot be identified, a paid extraction returns an x402 challenge.
 `;
+var AGENT_CARD = {
+  name: "Stringer CleanExtract",
+  description: "Charged only for usable content. Free outline, selected sections, and structured-data recovery. Failures: upstream_timeout, upstream_http_error, bot_challenge, js_shell, empty_extraction, sections_not_found.",
+  version: "0.4.0",
+  url: "https://extract.getstringer.app",
+  mcp_endpoint: "https://extract.getstringer.app/mcp",
+  tool: "clean_extract",
+  outline_tool: "clean_extract_outline",
+  price_usd: PRICE_USD,
+  free_allowance: { calls: FREE_CALL_LIMIT, scope: "lifetime", resets: false },
+  payment_rail: "x402 v2 USDC on Base mainnet",
+  stage: "DEPLOYED"
+};
+var NO_OAUTH_AUTHORIZATION_SERVER = {
+  error: "no_oauth_authorization_server",
+  service: "Stringer CleanExtract",
+  oauth_authorization_server: false,
+  payment: "x402 v2 USDC on Base mainnet",
+  mcp_endpoint: "https://extract.getstringer.app/mcp"
+};
+var NO_OAUTH_PROTECTED_RESOURCE = {
+  resource: "https://extract.getstringer.app",
+  oauth_protected: false,
+  payment: "x402 v2 USDC on Base mainnet",
+  mcp_endpoint: "https://extract.getstringer.app/mcp"
+};
 function discoveryResponse(body, contentType, method) {
   return new Response(method === "HEAD" ? null : body, {
     headers: {
@@ -574,17 +613,49 @@ function discoveryResponse(body, contentType, method) {
     }
   });
 }
+function discoveryJsonResponse(body, method) {
+  return new Response(method === "HEAD" ? null : JSON.stringify(body, null, 2), {
+    headers: {
+      "Content-Type": "application/json",
+      ...corsHeaders(),
+      "Cache-Control": "public, max-age=300"
+    }
+  });
+}
 function paymentProof(request) {
   return request.headers.get("PAYMENT-SIGNATURE") || request.headers.get("X-402-Payment-Proof");
 }
-async function sha256Hex(value) {
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
-  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+// Pseudonymise the caller address before anything stores it. A bare SHA-256 of an IP is
+// not a pseudonym: IPv4 is 2^32 addresses, so the whole keyspace inverts on a laptop, and
+// these values persist as Durable Object names. Keying the digest makes the mapping
+// irreversible without the key and rotatable when the mapping should be gone. There is no
+// unkeyed fallback: a missing key closes the free tier loudly instead of quietly
+// downgrading it to a reversible digest.
+async function callerFingerprint(value, env) {
+  const secret = typeof env?.FREE_TIER_HASH_KEY === "string" ? env.FREE_TIER_HASH_KEY.trim() : "";
+  if (!secret) {
+    console.error(JSON.stringify({
+      event_type: "free_tier_error",
+      operation: "fingerprint",
+      error: "FREE_TIER_HASH_KEY is not configured; the free tier stays closed until it is"
+    }));
+    return null;
+  }
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(value));
+  return Array.from(new Uint8Array(signature), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 async function claimFreeCall(request, env, transport) {
   const callerIp = request.headers.get("CF-Connecting-IP")?.trim();
   if (!callerIp || !env?.FREE_TIER_LIMITER) return { allowed: false, exhausted: false };
-  const callerHash = await sha256Hex(callerIp.toLowerCase());
+  const callerHash = await callerFingerprint(callerIp.toLowerCase(), env);
+  if (!callerHash) return { allowed: false, exhausted: false };
   try {
     const stub = env.FREE_TIER_LIMITER.getByName(callerHash);
     const response = await stub.fetch("https://free-tier.internal/claim", {
@@ -605,13 +676,49 @@ async function claimFreeCall(request, env, transport) {
     return { allowed: false, exhausted: false };
   }
 }
+
+// The five refusal classifications a 402 carries. Wake 280 split a single challenge counter
+// into these so a caller can tell a rejected payment from an absent one. The bundle reason
+// (wake 291) is a paid-rail internal and stays out of this reduced tree.
+const X402_CHALLENGE_REASONS = Object.freeze([
+  "settlement_failed_after_verify",
+  "payment_rejected",
+  "payment_absent",
+  "allowance_exhausted_challenge",
+  "terms_probe_challenge",
+]);
+
+function paymentRefusalReason(authorization) {
+  if (authorization?.freeDenial?.exhausted) return "allowance_exhausted_challenge";
+  return authorization?.paymentPresented ? "payment_rejected" : "payment_absent";
+}
+
+function logPaymentRefusal(reason, transport, paymentVerdict, callerHash) {
+  console.log(JSON.stringify({
+    event_type: "payment_refused",
+    reason,
+    transport,
+    error: paymentVerdict?.error ?? null,
+    caller_hash: callerHash ?? null,
+  }));
+}
+
+async function callerHashForRequest(request, env) {
+  const callerIp = request.headers.get("CF-Connecting-IP")?.trim();
+  if (!callerIp) return null;
+  return callerFingerprint(callerIp.toLowerCase(), env);
+}
+
 async function authorizeCall(request, env, transport) {
   const proof = paymentProof(request);
+  const callerHash = await callerHashForRequest(request, env);
   if (proof) {
     const paymentVerdict = await verifyPayment(proof, env);
-    return paymentVerdict.valid ? { allowed: true, accessTier: "paid", paymentVerdict } : { allowed: false, paymentVerdict };
+    return paymentVerdict.valid
+      ? { allowed: true, accessTier: "paid", paymentVerdict, paymentPresented: true, callerHash }
+      : { allowed: false, paymentVerdict, paymentPresented: true, callerHash };
   }
-  return { allowed: true, accessTier: "free_pending", transport };
+  return { allowed: true, accessTier: "free_pending", transport, paymentPresented: false, callerHash };
 }
 async function activateFreeAllowance(request, env, authorization) {
   if (authorization.accessTier !== "free_pending") return authorization;
@@ -620,7 +727,9 @@ async function activateFreeAllowance(request, env, authorization) {
   return {
     allowed: false,
     freeDenial: freeClaim,
-    paymentVerdict: await verifyPayment(null, env)
+    paymentVerdict: await verifyPayment(null, env),
+    paymentPresented: false,
+    callerHash: freeClaim.callerHash ?? authorization.callerHash ?? null
   };
 }
 function makeFreeDenied402(authorization, transport) {
@@ -632,28 +741,167 @@ function makeFreeDenied402(authorization, transport) {
   const response = make402Response(
     serviceName,
     PRICE_USD,
-    `Free allowance exhausted: ${FREE_CALL_LIMIT} free calls per source IP, total. The allowance does not reset. Pay the challenge below to continue.`,
+    `Free allowance exhausted: ${FREE_CALL_LIMIT} free calls, total. The allowance is metered per network address and does not reset, so a shared or corporate network may reach this before you have called 3 times. Pay the challenge below to continue.`,
     "inv_cleanextract",
     resourceUrl
   );
   response.headers.set("X-Stringer-Free-Remaining", "0");
   return response;
 }
-async function fetchPublicHtml(target) {
+
+// A request that names no work at all: `{}` on REST, or empty `arguments` on MCP. An unpaid
+// caller sending one is asking what this resource costs, not asking for an extraction, and
+// is owed the x402 challenge -- a directory validator probes exactly this way, and answering
+// it with a 400 hides the price. A body carrying keys but no url_or_html is a real request
+// with a real mistake and still gets the field error.
+function isTermsProbe(payload) {
+  return !payload || typeof payload !== "object" || Object.keys(payload).length === 0;
+}
+
+async function fetchPublicHtml(target, env) {
+  const timeoutMs = Number.isInteger(env?.FETCH_TIMEOUT_MS) && env.FETCH_TIMEOUT_MS > 0 && env.FETCH_TIMEOUT_MS <= FETCH_TIMEOUT_MS
+    ? env.FETCH_TIMEOUT_MS : FETCH_TIMEOUT_MS;
   try {
     const response = await safeFetch(target, {
-      headers: { "User-Agent": "CleanExtract/1.0" }
+      headers: { "User-Agent": "CleanExtract/1.0" },
+      signal: AbortSignal.timeout(timeoutMs)
     }, { maxResponseBytes: MAX_FETCHED_BODY_BYTES });
-    if (!response.ok) {
-      return { ok: false, error: `Upstream returned HTTP ${response.status}` };
-    }
-    return { ok: true, rawHtml: await response.text() };
+    return { ok: response.ok, status: response.status, headers: response.headers, rawHtml: await response.text() };
   } catch (error) {
-    if (error instanceof ResponseSizeLimitError) {
-      return { ok: false, error: error.message };
-    }
-    return { ok: false, error: "Upstream fetch failed" };
+    return {
+      ok: false,
+      timeout: error?.name === "TimeoutError" || error?.name === "AbortError",
+      error: error instanceof ResponseSizeLimitError ? error.message : "Upstream fetch failed"
+    };
   }
+}
+
+function assessExtractionQuality(rawHtml, extracted, sourceUrl) {
+  const encoder = new TextEncoder();
+  const sourceBytes = encoder.encode(rawHtml).length;
+  const envelope = sourceUrl ? `# ${extracted.title}\n\n*Source: [${sourceUrl}](${sourceUrl})*` : `# ${extracted.title}`;
+  const content = extracted.markdown.startsWith(envelope) ? extracted.markdown.slice(envelope.length).trim() : extracted.markdown.trim();
+  const extractedContentBytes = encoder.encode(content).length;
+  const ratio = sourceBytes ? extractedContentBytes / sourceBytes : 0;
+  const band = extractedContentBytes === 0 ? "zero" : ratio < CONTENT_RATIO_THRESHOLD ? "below_threshold" : "at_or_above_threshold";
+  return {
+    content_ratio_band: band,
+    source_bytes: sourceBytes,
+    fetched_bytes: sourceUrl ? sourceBytes : null,
+    extracted_content_bytes: extractedContentBytes,
+    extracted_to_source_ratio: Number(ratio.toFixed(3)),
+    extracted_to_fetched_ratio: sourceUrl ? Number(ratio.toFixed(3)) : null,
+    below_ratio_threshold: CONTENT_RATIO_THRESHOLD,
+    reason: band === "zero" ? "content-to-source byte ratio 0.0%: the delivered markdown carries no source-authored bytes"
+      : `content-to-source byte ratio ${(ratio * 100).toFixed(2)}% is ${band === "below_threshold" ? "below" : "at or above"} the 5% size threshold`
+  };
+}
+
+function outputCeilingError(value) {
+  if (value === undefined) return null;
+  return Number.isInteger(value) && value >= 1 && value <= MAX_OUTPUT_CEILING_BYTES
+    ? null : `max_output_bytes must be an integer from 1 to ${MAX_OUTPUT_CEILING_BYTES}`;
+}
+
+function sectionsInputError(value) {
+  if (value === undefined) return null;
+  return Array.isArray(value) && value.length >= 1 && value.length <= 50
+    && value.every((id) => typeof id === "string" && /^s[1-9][0-9]*$/.test(id))
+    ? null : "sections must be an array of 1 to 50 section ids such as s1";
+}
+
+function boundMarkdown(markdown, maxOutputBytes, parts = null) {
+  if (maxOutputBytes === undefined) return { markdown, receipt: null };
+  const encoded = new TextEncoder().encode(markdown);
+  let bounded = markdown;
+  let returnedBytes = encoded.length;
+  let sectionsDropped = [];
+  let firstSectionByteCut = false;
+  if (encoded.length > maxOutputBytes) {
+    const segments = parts ?? selectSections(markdown, outlineMarkdown(markdown).map((s) => s.id)).parts;
+    if (segments.length && new TextEncoder().encode(segments[0].body).length <= maxOutputBytes) {
+      let kept = "";
+      let count = 0;
+      for (const segment of segments) {
+        if (new TextEncoder().encode(kept + segment.body).length > maxOutputBytes) break;
+        kept += segment.body;
+        count += 1;
+      }
+      bounded = kept;
+      returnedBytes = new TextEncoder().encode(kept).length;
+      sectionsDropped = segments.slice(count).map((s) => s.id);
+    } else {
+      firstSectionByteCut = true;
+      sectionsDropped = segments.slice(1).map((s) => s.id);
+      returnedBytes = maxOutputBytes;
+      const decoder = new TextDecoder("utf-8", { fatal: true });
+      while (returnedBytes > 0) {
+        try { bounded = decoder.decode(encoded.slice(0, returnedBytes)); break; }
+        catch { returnedBytes -= 1; }
+      }
+      if (!returnedBytes) bounded = "";
+    }
+  }
+  return { markdown: bounded, receipt: {
+    ceiling_requested: true, max_output_bytes: maxOutputBytes,
+    truncation_occurred: returnedBytes < encoded.length,
+    original_output_bytes: encoded.length, returned_output_bytes: returnedBytes,
+    dropped_output_bytes: encoded.length - returnedBytes, sections_dropped: sectionsDropped,
+    first_section_byte_cut: firstSectionByteCut, re_request_with_max_output_bytes: encoded.length
+  } };
+}
+
+async function extractTarget(target, env, sections) {
+  let rawHtml = target;
+  let sourceUrl = null;
+  let fetchResult = null;
+  if (target.startsWith("http://") || target.startsWith("https://")) {
+    const safety = isSafePublicUrl(target);
+    if (!safety.safe) return { invalid: `SSRF blocked: ${safety.reason}` };
+    sourceUrl = safety.parsedUrl;
+    fetchResult = await fetchPublicHtml(sourceUrl, env);
+    rawHtml = fetchResult.rawHtml ?? "";
+  }
+  let extracted = fetchResult && !fetchResult.ok ? null : cleanHtmlToMarkdown(rawHtml, sourceUrl);
+  let quality = extracted ? assessExtractionQuality(rawHtml, extracted, sourceUrl) : null;
+  let outcome = classifyOutcome({ fetchResult, rawHtml, extracted, quality });
+  if (outcome.fallback) {
+    const fallback = outcome.fallback;
+    const envelope = sourceUrl ? `# ${extracted.title}\n\n*Source: [${sourceUrl}](${sourceUrl})*` : `# ${extracted.title}`;
+    const markdown = `${envelope}\n\n${fallback.markdown}`;
+    const cleanBytes = markdown.length;
+    extracted = { ...extracted, markdown, clean_bytes: cleanBytes,
+      tokens_saved: Math.max(0, Math.floor(rawHtml.length / 4) - Math.max(1, Math.floor(cleanBytes / 4))),
+      compression_ratio: `${Math.max(0, Math.round((1 - cleanBytes / Math.max(1, rawHtml.length)) * 100))}%` };
+    quality = assessExtractionQuality(rawHtml, extracted, sourceUrl);
+    outcome = { ...classifyOutcome({ fetchResult, rawHtml, extracted, quality }), fallback_used: fallback.source };
+  }
+  const selectedSections = extracted && sections ? selectSections(extracted.markdown, sections) : null;
+  if (selectedSections && outcome.charged) {
+    outcome = { ...classifyOutcome({ fetchResult, rawHtml, extracted, quality, selectedSections }), fallback_used: outcome.fallback_used };
+  }
+  return { rawHtml, sourceUrl, extracted, quality, outcome, selectedSections };
+}
+
+function outcomeHttpStatus(outcome) {
+  return outcome.status === "upstream_timeout" ? 504 : outcome.status === "upstream_http_error" ? 502 : 422;
+}
+
+function failureData(extraction) {
+  const { outcome, selectedSections } = extraction;
+  return { status: outcome.status, reason: outcome.reason, charged: false,
+    ...(selectedSections && outcome.status === "sections_not_found"
+      ? { sections_missing: selectedSections.sections_missing, available_sections: selectedSections.available_sections } : {}) };
+}
+
+async function outlineResult(target, env) {
+  const extraction = await extractTarget(target, env);
+  if (extraction.invalid || !extraction.outcome.charged) return { extraction };
+  const { extracted, outcome } = extraction;
+  return { extraction, result: { status: "ok", title: extracted.title,
+    ...(outcome.fallback_used ? { fallback_used: outcome.fallback_used } : {}),
+    total_bytes: new TextEncoder().encode(extracted.markdown).length,
+    fingerprint: await markdownFingerprint(extracted.markdown), sections: outlineMarkdown(extracted.markdown) } };
 }
 function restError(message, status) {
   return new Response(
@@ -664,24 +912,27 @@ function restError(message, status) {
     }
   );
 }
-async function finalizePaidResponse(response, paymentVerdict, env, serviceName, resourceUrl) {
+async function finalizePaidResponse(response, paymentVerdict, callerHash, env, serviceName, resourceUrl, transport) {
   if (!response.ok) return response;
   const settlement = await settlePayment(paymentVerdict, env);
   if (!settlement.valid) {
+    const reason = "settlement_failed_after_verify";
+    logPaymentRefusal(reason, transport, settlement, callerHash);
     return make402Response(serviceName, PRICE_USD, settlement.error, "inv_cleanextract", resourceUrl);
   }
   const settlementHeader = paymentResponseHeader(settlement);
   if (settlementHeader) response.headers.set("PAYMENT-RESPONSE", settlementHeader);
   return response;
 }
-async function finalizeFreeResponse(response, freeClaim, transport, resourceUrl) {
+async function finalizeFreeResponse(response, freeClaim, transport, resourceUrl, outcome = null) {
+  const charged = response.ok && (outcome?.charged ?? true);
   const receipt = {
     receipt_id: freeClaim.receipt_id,
     access_tier: "free",
     transport,
     caller_hash: freeClaim.callerHash,
     status: response.status,
-    outcome: response.ok ? "success" : "rejected",
+    outcome: charged ? "success" : "not_charged",
     recorded_at: (/* @__PURE__ */ new Date()).toISOString(),
     resource_url: resourceUrl
   };
@@ -701,70 +952,78 @@ async function finalizeFreeResponse(response, freeClaim, transport, resourceUrl)
   }
   response.headers.set("X-Stringer-Access-Tier", "free");
   response.headers.set("X-Stringer-Receipt-ID", freeClaim.receipt_id);
-  response.headers.set("X-Stringer-Free-Remaining", String(freeClaim.remaining));
+  response.headers.set("X-Stringer-Free-Remaining", String(freeClaim.remaining + (charged ? 0 : 1)));
   return response;
 }
-async function finalizeAuthorizedResponse(response, authorization, env, serviceName, resourceUrl, transport) {
+async function finalizeAuthorizedResponse(response, authorization, env, serviceName, resourceUrl, transport, outcome = null) {
   if (authorization.accessTier === "free") {
-    return finalizeFreeResponse(response, authorization.freeClaim, transport, resourceUrl);
+    return finalizeFreeResponse(response, authorization.freeClaim, transport, resourceUrl, outcome);
   }
-  return finalizePaidResponse(response, authorization.paymentVerdict, env, serviceName, resourceUrl);
+  return finalizePaidResponse(response, authorization.paymentVerdict, authorization.callerHash, env, serviceName, resourceUrl, transport);
 }
 function mcpToolDefinition() {
   return {
     name: "clean_extract",
-    description: "Extract clean, token-dense markdown from a public URL or raw HTML string.",
+    description: "Extract a full page or selected sections. A call is charged only when it returns usable content; 3 usable extractions are free, total, then USD 0.05. Use the free clean_extract_outline first. Uncharged failures name upstream_timeout, upstream_http_error, bot_challenge, js_shell, empty_extraction, or sections_not_found. Recovery names fallback_used.",
     inputSchema: {
       type: "object",
       properties: {
         url_or_html: {
           type: "string",
           description: "The public URL or raw HTML string to convert into markdown."
-        }
+        },
+        sections: { type: "array", minItems: 1, maxItems: 50, items: { type: "string", pattern: "^s[1-9][0-9]*$" } },
+        max_output_bytes: { type: "integer", minimum: 1, maximum: MAX_OUTPUT_CEILING_BYTES }
       },
       required: ["url_or_html"]
     }
   };
 }
-async function callMcpTool(id, params) {
-  if (params?.name !== "clean_extract") {
-    return mcpError(id, -32601, `Tool not found: ${params?.name || "unknown"}`, 404);
-  }
+function mcpOutlineDefinition() {
+  return { name: "clean_extract_outline",
+    description: "Free outline with section ids, headings, byte sizes, and a fingerprint, without page text or payment. A later clean_extract call can select sections and is charged only for usable content. Uncharged failures name upstream_timeout, upstream_http_error, bot_challenge, js_shell, empty_extraction, or sections_not_found. Recovery names fallback_used.",
+    inputSchema: { type: "object", properties: { url_or_html: { type: "string" } }, required: ["url_or_html"] } };
+}
+async function callMcpTool(id, params, env) {
   const target = params?.arguments?.url_or_html;
   if (typeof target !== "string" || target.length === 0) {
-    return mcpError(id, -32602, "url_or_html must be a non-empty string", 400);
+    return { response: mcpError(id, -32602, "url_or_html must be a non-empty string", 400) };
   }
-  let rawHtml = target;
-  let sourceUrl = null;
-  if (target.startsWith("http://") || target.startsWith("https://")) {
-    const safety = isSafePublicUrl(target);
-    if (!safety.safe) {
-      return mcpError(id, -32602, `SSRF blocked: ${safety.reason}`, 400);
-    }
-    sourceUrl = safety.parsedUrl;
-    const fetchResult = await fetchPublicHtml(sourceUrl);
-    if (!fetchResult.ok) {
-      return mcpError(id, -32e3, fetchResult.error, 502);
-    }
-    rawHtml = fetchResult.rawHtml;
+  const ceilingError = outputCeilingError(params?.arguments?.max_output_bytes);
+  if (ceilingError) return { response: mcpError(id, -32602, ceilingError, 400) };
+  const sectionsError = sectionsInputError(params?.arguments?.sections);
+  if (sectionsError) return { response: mcpError(id, -32602, sectionsError, 400) };
+  const extraction = await extractTarget(target, env, params?.arguments?.sections);
+  if (extraction.invalid) return { response: mcpError(id, -32602, extraction.invalid, 400) };
+  const { extracted, quality, outcome, selectedSections } = extraction;
+  if (!outcome.charged) {
+    return { response: mcpError(id, -32000, outcome.reason, outcomeHttpStatus(outcome), failureData(extraction)), outcome };
   }
-  const extracted = cleanHtmlToMarkdown(rawHtml, sourceUrl);
-  return mcpJson({
+  const bounded = boundMarkdown(selectedSections?.markdown ?? extracted.markdown, params?.arguments?.max_output_bytes, selectedSections?.parts ?? null);
+  const returnedSections = selectedSections
+    ? selectedSections.sections_returned.filter((sectionId) => !bounded.receipt?.sections_dropped.includes(sectionId)) : null;
+  return { response: mcpJson({
     jsonrpc: "2.0",
     id,
     result: {
-      content: [{ type: "text", text: extracted.markdown }],
+      content: [{ type: "text", text: bounded.markdown }],
       structuredContent: {
         title: extracted.title,
-        markdown: extracted.markdown,
+        markdown: bounded.markdown,
         tokens_saved: extracted.tokens_saved,
         compression_ratio: extracted.compression_ratio,
         raw_bytes: extracted.raw_bytes,
         clean_bytes: extracted.clean_bytes,
-        metadata: extracted.metadata
+        metadata: extracted.metadata,
+        extraction_content_ratio_band: quality.content_ratio_band,
+        extraction_quality: quality,
+        ...(outcome.fallback_used ? { fallback_used: outcome.fallback_used } : {}),
+        ...(selectedSections ? { fingerprint: await markdownFingerprint(extracted.markdown),
+          sections_returned: returnedSections, sections_missing: selectedSections.sections_missing } : {}),
+        ...(bounded.receipt ? { output_bounds: bounded.receipt } : {})
       }
     }
-  });
+  }), outcome };
 }
 async function handleStreamableHttp(request, env) {
   if (!validateMcpOrigin(request)) {
@@ -794,7 +1053,7 @@ async function handleStreamableHttp(request, env) {
       result: {
         protocolVersion: "2025-11-25",
         capabilities: { tools: {} },
-        serverInfo: { name: "cleanextract", version: "0.3.0" }
+        serverInfo: { name: "cleanextract", version: "0.4.0" }
       }
     }, 200, { "MCP-Protocol-Version": "2025-11-25" });
   }
@@ -802,11 +1061,21 @@ async function handleStreamableHttp(request, env) {
     return mcpJson({ jsonrpc: "2.0", id, result: {} });
   }
   if (method === "tools/list") {
-    return mcpJson({ jsonrpc: "2.0", id, result: { tools: [mcpToolDefinition()] } });
+    return mcpJson({ jsonrpc: "2.0", id, result: { tools: [mcpToolDefinition(), mcpOutlineDefinition()] } });
   }
   if (method === "tools/call") {
+    if (params?.name === "clean_extract_outline") {
+      const target = params?.arguments?.url_or_html;
+      if (typeof target !== "string" || !target.length) return mcpError(id, -32602, "url_or_html must be a non-empty string", 400);
+      const { extraction, result } = await outlineResult(target, env);
+      if (extraction.invalid) return mcpError(id, -32602, extraction.invalid, 400);
+      if (!result) return mcpError(id, -32000, extraction.outcome.reason, outcomeHttpStatus(extraction.outcome), failureData(extraction));
+      return mcpJson({ jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(result) }], structuredContent: result } });
+    }
     let authorization = await authorizeCall(request, env, "mcp");
     if (!authorization.allowed) {
+      const reason = paymentRefusalReason(authorization);
+      logPaymentRefusal(reason, "mcp", authorization.paymentVerdict, authorization.callerHash);
       return make402Response("CleanExtract MCP", PRICE_USD, authorization.paymentVerdict.error, "inv_cleanextract", request.url);
     }
     if (params?.name !== "clean_extract") {
@@ -815,10 +1084,18 @@ async function handleStreamableHttp(request, env) {
     if (typeof params?.arguments?.url_or_html !== "string" || params.arguments.url_or_html.length === 0) {
       return mcpError(id, -32602, "url_or_html must be a non-empty string", 400);
     }
+    const ceilingError = outputCeilingError(params.arguments.max_output_bytes);
+    if (ceilingError) return mcpError(id, -32602, ceilingError, 400);
+    const sectionsError = sectionsInputError(params.arguments.sections);
+    if (sectionsError) return mcpError(id, -32602, sectionsError, 400);
     authorization = await activateFreeAllowance(request, env, authorization);
-    if (!authorization.allowed) return makeFreeDenied402(authorization, "mcp");
-    const toolResponse = await callMcpTool(id, params);
-    return finalizeAuthorizedResponse(toolResponse, authorization, env, "CleanExtract MCP", request.url, "mcp");
+    if (!authorization.allowed) {
+      const reason = paymentRefusalReason(authorization);
+      logPaymentRefusal(reason, "mcp", authorization.paymentVerdict, authorization.callerHash);
+      return makeFreeDenied402(authorization, "mcp");
+    }
+    const tool = await callMcpTool(id, params, env);
+    return finalizeAuthorizedResponse(tool.response, authorization, env, "CleanExtract MCP", request.url, "mcp", tool.outcome);
   }
   return mcpError(id, -32601, `Method not found: ${method}`, 404);
 }
@@ -842,12 +1119,27 @@ var worker_default = {
     if ((request.method === "GET" || request.method === "HEAD") && url.pathname === "/llms.txt") {
       return discoveryResponse(LLMS_TEXT, "text/plain; charset=utf-8", request.method);
     }
+    // Discovery paths served from the wake 286 telemetry reading: real clients probed these
+    // three, and asked for /server.json exactly zero times, so the reference answers the same
+    // way the live service does and leaves /server.json to the 404 fallback below.
+    if ((request.method === "GET" || request.method === "HEAD") && url.pathname === "/.well-known/agent-card.json") {
+      return discoveryJsonResponse(AGENT_CARD, request.method);
+    }
+    if ((request.method === "GET" || request.method === "HEAD") && url.pathname === "/.well-known/oauth-authorization-server") {
+      return discoveryJsonResponse(NO_OAUTH_AUTHORIZATION_SERVER, request.method);
+    }
+    if ((request.method === "GET" || request.method === "HEAD") && url.pathname === "/.well-known/oauth-protected-resource") {
+      return discoveryJsonResponse(NO_OAUTH_PROTECTED_RESOURCE, request.method);
+    }
     if (url.pathname === "/" || url.pathname === "/info") {
       return new Response(
         JSON.stringify({
           service: "CleanExtract",
           subdomain: "extract.getstringer.app",
-          tagline: "Token-efficient markdown & structured data extraction API for LLM context windows",
+          tagline: "Free outline and selected sections; charged only for usable content",
+          extraction_outcomes: ["ok", "upstream_timeout", "upstream_http_error", "bot_challenge", "js_shell", "empty_extraction", "sections_not_found"],
+          outline: { route: "/v1/outline", tool: "clean_extract_outline", price_usd: 0 },
+          fallback_sources: ["json_ld", "next_data", "nuxt_data"],
           monetization: "x402 on Base",
           price_usd: PRICE_USD,
           free_allowance: {
@@ -878,9 +1170,21 @@ var worker_default = {
         headers: { "Allow": "POST, OPTIONS", ...corsHeaders() }
       });
     }
+    if (url.pathname === "/v1/outline" && request.method === "POST") {
+      let body;
+      try { body = await request.json(); } catch { return restError("Request body must be valid JSON", 400); }
+      const target = body?.url_or_html;
+      if (typeof target !== "string" || !target.length) return restError("url_or_html must be a non-empty string", 400);
+      const { extraction, result } = await outlineResult(target, env);
+      if (extraction.invalid) return restError(extraction.invalid, 400);
+      if (!result) return new Response(JSON.stringify(failureData(extraction)), { status: outcomeHttpStatus(extraction.outcome), headers: { "Content-Type": "application/json", ...corsHeaders() } });
+      return new Response(JSON.stringify(result), { headers: { "Content-Type": "application/json", ...corsHeaders() } });
+    }
     if (url.pathname === "/v1/execute" && request.method === "POST") {
       let authorization = await authorizeCall(request, env, "rest");
       if (!authorization.allowed) {
+        const reason = paymentRefusalReason(authorization);
+        logPaymentRefusal(reason, "rest", authorization.paymentVerdict, authorization.callerHash);
         return make402Response("CleanExtract", PRICE_USD, authorization.paymentVerdict.error, "inv_cleanextract", request.url);
       }
       let body;
@@ -891,31 +1195,48 @@ var worker_default = {
       }
       const target = body?.url_or_html;
       if (typeof target !== "string" || target.length === 0) {
+        if (authorization.accessTier !== "paid" && isTermsProbe(body)) {
+          const reason = "terms_probe_challenge";
+          const paymentVerdict = await verifyPayment(null, env);
+          logPaymentRefusal(reason, "rest", paymentVerdict, authorization.callerHash);
+          return make402Response("CleanExtract", PRICE_USD, paymentVerdict.error, "inv_cleanextract", request.url);
+        }
         return restError("url_or_html must be a non-empty string", 400);
       }
+      const ceilingError = outputCeilingError(body?.max_output_bytes);
+      if (ceilingError) return restError(ceilingError, 400);
+      const sectionsError = sectionsInputError(body?.sections);
+      if (sectionsError) return restError(sectionsError, 400);
       authorization = await activateFreeAllowance(request, env, authorization);
-      if (!authorization.allowed) return makeFreeDenied402(authorization, "rest");
-      let rawHtml = target;
-      let sourceUrl = null;
-      if (target.startsWith("http://") || target.startsWith("https://")) {
-        const safety = isSafePublicUrl(target);
-        if (!safety.safe) {
-          return restError(`SSRF Blocked: ${safety.reason}`, 400);
-        }
-        sourceUrl = safety.parsedUrl;
-        const fetchResult = await fetchPublicHtml(sourceUrl);
-        if (!fetchResult.ok) {
-          return restError(fetchResult.error, 502);
-        }
-        rawHtml = fetchResult.rawHtml;
+      if (!authorization.allowed) {
+        const reason = paymentRefusalReason(authorization);
+        logPaymentRefusal(reason, "rest", authorization.paymentVerdict, authorization.callerHash);
+        return makeFreeDenied402(authorization, "rest");
       }
-      const extracted = cleanHtmlToMarkdown(rawHtml, sourceUrl);
+      const extraction = await extractTarget(target, env, body?.sections);
+      if (extraction.invalid) return finalizeAuthorizedResponse(restError(extraction.invalid, 400), authorization, env, "CleanExtract", request.url, "rest");
+      const { extracted, quality, outcome, selectedSections } = extraction;
+      if (!outcome.charged) {
+        const response = new Response(JSON.stringify({ ...failureData(extraction), message: outcome.reason }), {
+          status: outcomeHttpStatus(outcome), headers: { "Content-Type": "application/json", ...corsHeaders() }
+        });
+        return finalizeAuthorizedResponse(response, authorization, env, "CleanExtract", request.url, "rest", outcome);
+      }
+      const bounded = boundMarkdown(selectedSections?.markdown ?? extracted.markdown, body?.max_output_bytes, selectedSections?.parts ?? null);
+      const returnedSections = selectedSections
+        ? selectedSections.sections_returned.filter((sectionId) => !bounded.receipt?.sections_dropped.includes(sectionId)) : null;
       const extractionResponse = new Response(
         JSON.stringify({
           status: "success",
           service: "CleanExtract",
           target,
-          clean_markdown: extracted.markdown,
+          clean_markdown: bounded.markdown,
+          extraction_content_ratio_band: quality.content_ratio_band,
+          extraction_quality: quality,
+          ...(outcome.fallback_used ? { fallback_used: outcome.fallback_used } : {}),
+          ...(selectedSections ? { fingerprint: await markdownFingerprint(extracted.markdown),
+            sections_returned: returnedSections, sections_missing: selectedSections.sections_missing } : {}),
+          ...(bounded.receipt ? { output_bounds: bounded.receipt } : {}),
           provenance: {
             title: extracted.title,
             metadata: extracted.metadata,
@@ -931,7 +1252,7 @@ var worker_default = {
           headers: { "Content-Type": "application/json", ...corsHeaders() }
         }
       );
-      return finalizeAuthorizedResponse(extractionResponse, authorization, env, "CleanExtract", request.url, "rest");
+      return finalizeAuthorizedResponse(extractionResponse, authorization, env, "CleanExtract", request.url, "rest", outcome);
     }
     return new Response(JSON.stringify({ error: "Not Found" }), {
       status: 404,
@@ -970,7 +1291,7 @@ class FreeTierLimiter {
         return new Response(JSON.stringify({ error: "Invalid claim" }), { status: 400 });
       }
       return this.state.storage.transactionSync(() => {
-        const used = this.state.storage.sql.exec("SELECT COUNT(*) AS count FROM free_call_receipts").one().count;
+        const used = this.state.storage.sql.exec("SELECT COUNT(*) AS count FROM free_call_receipts WHERE outcome != 'not_charged'").one().count;
         if (used >= FREE_CALL_LIMIT) {
           return Response.json({ allowed: false, remaining: 0, reset_at: null });
         }

@@ -59,6 +59,9 @@ function freeTierEnvironment(initialUsed = 0) {
   const finalized = [];
   return {
     finalized,
+    // The worker keys its caller fingerprints and has no unkeyed fallback, so an
+    // environment without this secret exercises the closed free tier, not the open one.
+    FREE_TIER_HASH_KEY: "test-free-tier-hash-key",
     FREE_TIER_LIMITER: {
       getByName(callerHash) {
         if (!claimsByCaller.has(callerHash)) claimsByCaller.set(callerHash, initialUsed);
@@ -80,6 +83,7 @@ function freeTierEnvironment(initialUsed = 0) {
             }
             if (pathname === "/finalize") {
               finalized.push(body);
+              if (body.outcome === "not_charged") claimsByCaller.set(callerHash, claimsByCaller.get(callerHash) - 1);
               return Response.json({ stored: true });
             }
             return Response.json({ error: "Not Found" }, { status: 404 });
@@ -108,7 +112,7 @@ test("HTML extraction preserves tables and source metadata", () => {
   assert.equal(result.metadata.canonical_url, "https://example.com/canonical");
 });
 
-test("MCP initialize and tools/list expose one Streamable HTTP tool", async () => {
+test("MCP initialize and tools/list expose both Streamable HTTP tools", async () => {
   const initialize = await cleanExtractWorker.fetch(mcpRequest({
     jsonrpc: "2.0",
     id: 1,
@@ -127,7 +131,7 @@ test("MCP initialize and tools/list expose one Streamable HTTP tool", async () =
     params: {},
   }), {}, {});
   const listed = await list.json();
-  assert.deepEqual(listed.result.tools.map(({ name }) => name), ["clean_extract"]);
+  assert.deepEqual(listed.result.tools.map(({ name }) => name), ["clean_extract", "clean_extract_outline"]);
 });
 
 test("MCP rejects an unsupported browser origin", async () => {
@@ -212,8 +216,8 @@ test("the fourth unpaid call receives the exhausted-allowance x402 challenge", a
   assert.equal(response.status, 402);
   assert.equal(response.headers.get("X-Stringer-Free-Remaining"), "0");
   const challenge = await response.json();
-  assert.match(challenge.error, /Free allowance exhausted: 3 free calls per source IP, total/);
-  assert.match(challenge.error, /allowance does not reset/);
+  assert.match(challenge.error, /Free allowance exhausted: 3 free calls, total/);
+  assert.match(challenge.error, /does not reset/);
   assert.equal(challenge.accepts[0].amount, "50000");
 });
 
@@ -343,5 +347,136 @@ test("valid x402 authorization is verified, settled, and receipted", async () =>
     assert.equal(receipt.transaction, transaction);
   } finally {
     globalThis.fetch = originalFetch;
+  }
+});
+
+function captureRefusalLogs() {
+  const refusalLogs = [];
+  const originalLog = console.log;
+  console.log = (line) => {
+    try {
+      const entry = typeof line === "string" ? JSON.parse(line) : line;
+      if (entry && entry.event_type === "payment_refused") refusalLogs.push(entry);
+    } catch (e) {
+      // not a JSON log line
+    }
+    return originalLog.call(console, line);
+  };
+  return { refusalLogs, restore: () => { console.log = originalLog; } };
+}
+
+test("both MCP tool descriptions state the charging and outline rules", async () => {
+  const listed = await cleanExtractWorker.fetch(mcpRequest({
+    jsonrpc: "2.0",
+    id: 20,
+    method: "tools/list",
+    params: {},
+  }), {}, {});
+  const tools = (await listed.json()).result.tools;
+  assert.deepEqual(tools.map((tool) => tool.name), ["clean_extract", "clean_extract_outline"]);
+  const description = tools[0].description;
+  assert.match(description, /charged only when it returns usable content/);
+  assert.match(description, /free clean_extract_outline/);
+  assert.match(description, /js_shell/);
+  assert.match(tools[1].description, /Free outline/);
+  assert.match(tools[1].description, /charged only for usable content/);
+  assert.doesNotMatch(description, /extraction_status|plausibly_full_document/);
+});
+
+test("a presented payment that fails verification classifies payment_rejected", async () => {
+  const payload = validPaymentPayload();
+  payload.accepted.amount = "1";
+  const { refusalLogs, restore } = captureRefusalLogs();
+  try {
+    const response = await cleanExtractWorker.fetch(restRequest({
+      url_or_html: "<h1>Paid</h1>",
+    }, { "PAYMENT-SIGNATURE": base64Json(payload) }), {}, {});
+    assert.equal(response.status, 402);
+    assert.match((await response.json()).error, /Payment amount mismatch/);
+    assert.equal(refusalLogs.length, 1);
+    assert.equal(refusalLogs[0].reason, "payment_rejected");
+    assert.equal(refusalLogs[0].transport, "rest");
+  } finally {
+    restore();
+  }
+});
+
+test("a refusal with no payment and no identifiable source classifies payment_absent", async () => {
+  const { refusalLogs, restore } = captureRefusalLogs();
+  try {
+    const response = await cleanExtractWorker.fetch(restRequest({
+      url_or_html: "<h1>Hello</h1>",
+    }), {}, {});
+    assert.equal(response.status, 402);
+    assert.match((await response.json()).error, /Missing payment authorization/);
+    assert.equal(refusalLogs.length, 1);
+    assert.equal(refusalLogs[0].reason, "payment_absent");
+    assert.equal(refusalLogs[0].transport, "rest");
+  } finally {
+    restore();
+  }
+});
+
+test("an exhausted allowance classifies allowance_exhausted_challenge", async () => {
+  const env = freeTierEnvironment();
+  const headers = { "CF-Connecting-IP": "198.51.100.20" };
+  const { refusalLogs, restore } = captureRefusalLogs();
+  try {
+    for (let call = 0; call < 3; call += 1) {
+      const response = await cleanExtractWorker.fetch(restRequest({
+        url_or_html: "<p>Free</p>",
+      }, headers), env, {});
+      assert.equal(response.status, 200, `free call ${call + 1}`);
+    }
+    const exhausted = await cleanExtractWorker.fetch(restRequest({
+      url_or_html: "<p>Paid next</p>",
+    }, headers), env, {});
+    assert.equal(exhausted.status, 402);
+    assert.equal(exhausted.headers.get("X-Stringer-Free-Remaining"), "0");
+    assert.equal(refusalLogs.length, 1);
+    assert.equal(refusalLogs[0].reason, "allowance_exhausted_challenge");
+  } finally {
+    restore();
+  }
+});
+
+test("a settlement failure after verification classifies settlement_failed_after_verify", async () => {
+  const paymentPayload = validPaymentPayload();
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    if (String(url).endsWith("/verify")) {
+      return Response.json({ isValid: true, payer: paymentPayload.payload.authorization.from });
+    }
+    return Response.json({ success: false, errorReason: "facilitator refused transfer" });
+  };
+  const { refusalLogs, restore } = captureRefusalLogs();
+  try {
+    const response = await cleanExtractWorker.fetch(restRequest({
+      url_or_html: "<h1>Paid</h1>",
+    }, { "PAYMENT-SIGNATURE": base64Json(paymentPayload) }), {
+      X402_FACILITATOR_URL: "https://facilitator.example",
+    }, {});
+    assert.equal(response.status, 402);
+    assert.match((await response.json()).error, /Payment settlement failed: facilitator refused transfer/);
+    assert.equal(refusalLogs.length, 1);
+    assert.equal(refusalLogs[0].reason, "settlement_failed_after_verify");
+    assert.equal(refusalLogs[0].transport, "rest");
+  } finally {
+    restore();
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("an empty REST body from an unpaid caller classifies terms_probe_challenge", async () => {
+  const { refusalLogs, restore } = captureRefusalLogs();
+  try {
+    const response = await cleanExtractWorker.fetch(restRequest({}), {}, {});
+    assert.equal(response.status, 402);
+    assert.match((await response.json()).error, /Missing payment authorization/);
+    assert.equal(refusalLogs.length, 1);
+    assert.equal(refusalLogs[0].reason, "terms_probe_challenge");
+    assert.equal(refusalLogs[0].transport, "rest");
+  } finally {
+    restore();
   }
 });
